@@ -117,7 +117,6 @@ def notificar_ofertas_telegram(df_melhores: pd.DataFrame, df_final: pd.DataFrame
         f"<i>{len(df_melhores)} itens abaixo da média regional encontrados:</i>\n",
     ]
 
-    # Agrupa por supermercado para facilitar a decisão de onde ir
     for mercado, grupo in df_melhores.groupby("mercado"):
         linhas.append(f"🏪 <b>{html.escape(str(mercado))}</b>")
         for _, row in grupo.iterrows():
@@ -219,8 +218,9 @@ def coletar_imagens_encartes(page, mercado: str, url: str) -> List[Image.Image]:
     urls_coletadas = set()
 
     try:
-        page.goto(url, wait_until="networkidle", timeout=45000)
-        page.wait_for_timeout(3000)
+        # domcontentloaded evita timeout causado por scripts de rastreamento/analytics
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(5000)
 
         if "comercialesperanca" in url:
             selects = page.locator("select").all()
@@ -228,13 +228,13 @@ def coletar_imagens_encartes(page, mercado: str, url: str) -> List[Image.Image]:
                 if "Mogi" in sel.inner_text():
                     try:
                         sel.select_option(label="Mogi das Cruzes")
-                        page.wait_for_timeout(2000)
+                        page.wait_for_timeout(3000)
                     except Exception:
                         pass
 
         for _ in range(5):
             page.mouse.wheel(0, 1200)
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(1000)
 
         if "maxatacadista" in url:
             for _ in range(12):
@@ -245,7 +245,7 @@ def coletar_imagens_encartes(page, mercado: str, url: str) -> List[Image.Image]:
                 btn_next = page.locator(".pswp__button--arrow--right")
                 if btn_next.is_visible():
                     btn_next.click()
-                    page.wait_for_timeout(1000)
+                    page.wait_for_timeout(1200)
                 else:
                     break
 
@@ -278,15 +278,15 @@ def coletar_semar_ecommerce(page, client: genai.Client) -> List[dict]:
     ofertas_semar = []
 
     try:
-        page.goto(url, wait_until="networkidle", timeout=45000)
-        page.wait_for_timeout(3000)
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(4000)
 
-        page.goto("https://semarentrega.com.br/loja-08-cezar-de-souza/ofertas", wait_until="networkidle", timeout=45000)
-        page.wait_for_timeout(3000)
+        page.goto("https://semarentrega.com.br/loja-08-cezar-de-souza/ofertas", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(5000)
 
         for _ in range(6):
             page.mouse.wheel(0, 1200)
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(1000)
 
         texto_pagina = page.locator("body").inner_text()
         linhas_relevantes = [l.strip() for l in texto_pagina.split("\n") if len(l.strip()) > 2]
@@ -388,14 +388,15 @@ def main():
     if not os.environ.get("GEMINI_API_KEY"):
         raise EnvironmentError("Defina a variável de ambiente GEMINI_API_KEY.")
 
-    client = genai.Client()
+    # Força v1beta para habilitar JSON mode / Structured Outputs sem erro 400
+    client = genai.Client(http_options={"api_version": "v1beta"})
     todas_ofertas = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             viewport={"width": 1366, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         )
         page = context.new_page()
 
@@ -415,6 +416,10 @@ def main():
 
     if not todas_ofertas:
         print("\n[Aviso] Nenhuma oferta extraída hoje.")
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        if token and chat_id:
+            enviar_telegram_texto(token, chat_id, "⚠️ <b>Monitor Mogi:</b> Nenhuma oferta pôde ser extraída hoje. Verifique os logs no GitHub.")
         return
 
     df_bruto = pd.DataFrame(todas_ofertas)
