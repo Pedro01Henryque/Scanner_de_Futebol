@@ -468,24 +468,11 @@ def main():
         )
         return
 
-    df_destaques = df_jogos[df_jogos["edge_over25_%"].notna() & (df_jogos["edge_over25_%"] >= 5.0)].sort_values(
-        by="edge_over25_%", ascending=False
-    )
-
     blocos = [
         f"⚽ <b>SCANNER MATINAL DE FUTEBOL — {data_hoje}</b>\n<i>{len(df_jogos)} jogo(s) analisado(s) nas próximas 30h</i>"
     ]
 
-    if not df_destaques.empty:
-        dest_txt = ["🔥 <b>DESTAQUES COM VALOR (+EV ≥ 5%):</b>"]
-        for _, r in df_destaques.iterrows():
-            jogo = html.escape(str(r["jogo"]))
-            dest_txt.append(
-                f"• <b>{jogo}</b> ({r['horario_brt']})\n"
-                f"  Over 2.5: <b>{formatar_odd(r['odd_over25'])}</b> | Hist: <b>{formatar_pct(r['prob_over25_est_%'])}</b> (Edge: <b>+{r['edge_over25_%']}%</b>)"
-            )
-        blocos.append("\n".join(dest_txt))
-
+    # 1. Grade completa organizada por liga e ordem cronológica
     for liga, grupo in df_jogos.groupby("liga"):
         grupo_ord = grupo.sort_values(by="horario_brt", ascending=True)
         liga_txt = [f"🏆 <b>{html.escape(str(liga))}</b>"]
@@ -510,11 +497,30 @@ def main():
             )
         blocos.append("\n\n".join(liga_txt))
 
+    # 2. Leitura Rápida IA
     if gemini_key:
         client = genai.Client(http_options={"api_version": "v1beta"})
         analise_ia = gerar_resumo_gemini(client, df_jogos.head(12))
         if analise_ia:
             blocos.append(f"🧠 <b>Leitura Rápida IA:</b>\n{analise_ia}")
+
+    # 3. Resumo final apenas com os jogos de Edge Positivo (> 0%)
+    df_edge_positivo = df_jogos[df_jogos["edge_over25_%"].notna() & (df_jogos["edge_over25_%"] > 0)].sort_values(
+        by="edge_over25_%", ascending=False
+    )
+
+    if not df_edge_positivo.empty:
+        edge_txt = ["✅ <b>RESUMO — APENAS EDGE POSITIVO (Over 2.5):</b>"]
+        for _, r in df_edge_positivo.iterrows():
+            jogo = html.escape(str(r["jogo"]))
+            liga = html.escape(str(r["liga"]))
+            edge_txt.append(
+                f"• <b>{jogo}</b> ({liga} • <code>{r['horario_brt']}</code>)\n"
+                f"  Odd: <b>{formatar_odd(r['odd_over25'])}</b> | Hist: <b>{formatar_pct(r['prob_over25_est_%'])}</b> | Edge: <b>+{r['edge_over25_%']:.1f}%</b>"
+            )
+        blocos.append("\n".join(edge_txt))
+    else:
+        blocos.append("✅ <b>RESUMO — EDGE POSITIVO:</b>\n<i>Nenhum jogo com Edge positivo em Over 2.5 hoje.</i>")
 
     mensagem_final = "\n\n".join(blocos)
     enviar_telegram_texto(tg_token, tg_chat, mensagem_final)
