@@ -14,7 +14,6 @@ from google import genai
 # ==============================================================================
 
 GEMINI_MODEL = "gemini-2.5-flash"
-ARQUIVO_SAIDA = f"scanner_futebol_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
 
 # Ligas monitoradas na The Odds API + fontes abertas de resultados da temporada
 LIGAS_ALVO = [
@@ -50,7 +49,6 @@ LIGAS_ALVO = [
     },
 ]
 
-# Mapeamento de nomes de times (Odds API -> Football-Data CSV)
 ALIASES_TIMES = {
     "atletico mineiro": "atletico-mg",
     "athletico paranaense": "athletico-pr",
@@ -87,15 +85,37 @@ def normalizar_time(nome: str) -> str:
 
 
 def enviar_telegram_texto(token: str, chat_id: str, mensagem_html: str) -> None:
+    """Envia mensagens formatadas em HTML para o Telegram, dividindo com segurança se passar de 3800 chars."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    limite = 4000
-    partes = [mensagem_html[i : i + limite] for i in range(0, len(mensagem_html), limite)]
-    for parte in partes:
+    limite = 3800
+
+    # Divide por quebras de linha para não cortar tags HTML no meio
+    blocos = mensagem_html.split("\n\n")
+    parte_atual = ""
+
+    for bloco in blocos:
+        if len(parte_atual) + len(bloco) + 2 <= limite:
+            parte_atual += (bloco + "\n\n")
+        else:
+            if parte_atual.strip():
+                requests.post(
+                    url,
+                    json={
+                        "chat_id": chat_id,
+                        "text": parte_atual.strip(),
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=20,
+                )
+            parte_atual = bloco + "\n\n"
+
+    if parte_atual.strip():
         resp = requests.post(
             url,
             json={
                 "chat_id": chat_id,
-                "text": parte,
+                "text": parte_atual.strip(),
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
@@ -105,25 +125,11 @@ def enviar_telegram_texto(token: str, chat_id: str, mensagem_html: str) -> None:
             print(f"[!] Erro Telegram texto: {resp.text}")
 
 
-def enviar_telegram_arquivo(token: str, chat_id: str, caminho: str, legenda: str) -> None:
-    url = f"https://api.telegram.org/bot{token}/sendDocument"
-    with open(caminho, "rb") as f:
-        resp = requests.post(
-            url,
-            data={"chat_id": chat_id, "caption": legenda},
-            files={"document": f},
-            timeout=30,
-        )
-    if not resp.ok:
-        print(f"[!] Erro Telegram arquivo: {resp.text}")
-
-
 # ==============================================================================
 # COLETA DE ESTATÍSTICAS HISTÓRICAS E ODDS DO DIA
 # ==============================================================================
 
 def carregar_estatisticas_liga(url_csv: str, formato_novo: bool) -> Dict[str, dict]:
-    """Calcula médias casa/fora, frequência de Over 2.5 e Ambas Marcam (BTTS) dos últimos jogos."""
     try:
         df = pd.read_csv(url_csv)
     except Exception as e:
@@ -131,11 +137,9 @@ def carregar_estatisticas_liga(url_csv: str, formato_novo: bool) -> Dict[str, di
         return {}
 
     if formato_novo:
-        # Formato BRA.csv (Home, Away, HG, AG)
         col_h, col_a, col_hg, col_ag = "Home", "Away", "HG", "AG"
-        df = df.tail(380)  # Última temporada completa/atual
+        df = df.tail(380)
     else:
-        # Formato europeu (HomeTeam, AwayTeam, FTHG, FTAG)
         col_h, col_a, col_hg, col_ag = "HomeTeam", "AwayTeam", "FTHG", "FTAG"
 
     df = df.dropna(subset=[col_h, col_a, col_hg, col_ag]).copy()
@@ -160,19 +164,16 @@ def carregar_estatisticas_liga(url_csv: str, formato_novo: bool) -> Dict[str, di
             "casa_gols_sofridos": round(jogos_casa[col_ag].mean(), 2),
             "casa_over25_%": round(jogos_casa["over25"].mean() * 100, 1),
             "casa_btts_%": round(jogos_casa["btts"].mean() * 100, 1),
-            "casa_vitorias_%": round((jogos_casa[col_hg] > jogos_casa[col_ag]).mean() * 100, 1),
             "fora_gols_pro": round(jogos_fora[col_ag].mean(), 2),
             "fora_gols_sofridos": round(jogos_fora[col_hg].mean(), 2),
             "fora_over25_%": round(jogos_fora["over25"].mean() * 100, 1),
             "fora_btts_%": round(jogos_fora["btts"].mean() * 100, 1),
-            "fora_vitorias_%": round((jogos_fora[col_ag] > jogos_fora[col_hg]).mean() * 100, 1),
         }
 
     return stats_times
 
 
 def buscar_odds_liga(api_key: str, odds_key: str) -> List[dict]:
-    """Busca jogos das próximas 30 horas com odds de Moneyline (1x2) e Over/Under 2.5."""
     url = f"https://api.the-odds-api.com/v4/sports/{odds_key}/odds"
     agora_utc = datetime.now(timezone.utc)
     limite_utc = agora_utc + timedelta(hours=30)
@@ -198,7 +199,6 @@ def buscar_odds_liga(api_key: str, odds_key: str) -> List[dict]:
 
 
 def extrair_melhores_odds_evento(evento: dict) -> dict:
-    """Pega a melhor odd disponível entre as casas para Casa, Empate, Fora, Over 2.5 e Under 2.5."""
     melhores = {
         "odd_casa": None,
         "odd_empate": None,
@@ -241,7 +241,6 @@ def encontrar_stats_time(nome_api: str, base_stats: Dict[str, dict]) -> Optional
     norm = normalizar_time(nome_api)
     if norm in base_stats:
         return base_stats[norm]
-    # Busca parcial caso haja prefixo/sufixo (ex: "FC Barcelona" -> "barcelona")
     for k, v in base_stats.items():
         if k in norm or norm in k:
             return v
@@ -271,7 +270,6 @@ def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
             st_home = encontrar_stats_time(home, stats_liga)
             st_away = encontrar_stats_time(away, stats_liga)
 
-            # Modelo simples de probabilidade combinada Casa + Fora
             if st_home and st_away:
                 prob_over25_est = round((st_home["casa_over25_%"] + st_away["fora_over25_%"]) / 2, 1)
                 prob_btts_est = round((st_home["casa_btts_%"] + st_away["fora_btts_%"]) / 2, 1)
@@ -290,7 +288,6 @@ def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
                 prob_btts_est = None
                 xg_projetado = None
 
-            # Calcula +EV no mercado de Over 2.5 Gols
             ev_over25_pct = None
             prob_implicita_over = None
             if prob_over25_est and odds["odd_over25"]:
@@ -318,20 +315,20 @@ def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
 
 
 # ==============================================================================
-# SÍNTESE COM GEMINI E DISPARO NO TELEGRAM
+# SÍNTESE COM GEMINI E DISPARO EM TEXTO PURO NO TELEGRAM
 # ==============================================================================
 
-def gerar_resumo_gemini(client: genai.Client, df_destaques: pd.DataFrame) -> str:
-    tabela_txt = df_destaques.to_string(index=False)
+def gerar_resumo_gemini(client: genai.Client, df_jogos: pd.DataFrame) -> str:
+    tabela_txt = df_jogos.to_string(index=False)
     prompt = f"""
     Você é um analista quantitativo de apostas esportivas.
-    Analise esta tabela de jogos filtrados hoje com Edge (+EV) positivo no mercado de gols:
+    Analise esta grade de jogos do dia com suas odds e métricas estatísticas:
     
     {tabela_txt}
     
-    Escreva um resumo objetivo em português (máximo 12 linhas, usando tags HTML simples <b> e <i> para Telegram)
-    destacando os 3 melhores jogos do dia, explicando brevemente por que a média de gols projetada e a frequência histórica
-    justificam valor frente à odd aberta. Sem floreios ou introduções genéricas.
+    Escreva uma leitura rápida e objetiva em português (máximo 10 linhas, usando apenas tags HTML <b> e <i> para Telegram)
+    destacando os jogos mais interessantes do dia (seja para Over 2.5, Ambas Marcam ou favoritismo com valor) com base nos números.
+    Direto ao ponto, sem saudações ou introduções genéricas.
     """
     try:
         resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
@@ -339,6 +336,14 @@ def gerar_resumo_gemini(client: genai.Client, df_destaques: pd.DataFrame) -> str
     except Exception as e:
         print(f"[!] Erro ao gerar comentário Gemini: {e}")
         return ""
+
+
+def formatar_odd(val) -> str:
+    return f"@{val:.2f}" if pd.notna(val) else "-"
+
+
+def formatar_pct(val) -> str:
+    return f"{val:.0f}%" if pd.notna(val) else "-"
 
 
 def main():
@@ -353,58 +358,60 @@ def main():
     df_jogos = analisar_oportunidades_dia(odds_key)
     data_hoje = datetime.now().strftime("%d/%m/%Y")
 
-    if df_jogos.empty:
-        print("\n[Info] Nenhum jogo encontrado nas ligas monitoradas hoje.")
-        if tg_token and tg_chat:
-            enviar_telegram_texto(
-                tg_token,
-                tg_chat,
-                f"⚽ <b>Scanner Futebol ({data_hoje})</b>\n\nSem jogos das ligas monitoradas nas próximas 30 horas.",
-            )
-        return
-
-    df_jogos = df_jogos.sort_values(by="edge_over25_%", ascending=False, na_position="last")
-    df_destaques = df_jogos[df_jogos["edge_over25_%"].notna() & (df_jogos["edge_over25_%"] >= 5.0)]
-
-    with pd.ExcelWriter(ARQUIVO_SAIDA, engine="openpyxl") as writer:
-        df_destaques.to_excel(writer, sheet_name="Oportunidades +EV", index=False)
-        df_jogos.to_excel(writer, sheet_name="Grade Completa", index=False)
-
     if not tg_token or not tg_chat:
         print("[Aviso] Telegram não configurado.")
         return
 
-    linhas = [f"⚽ <b>SCANNER MATINAL DE VALOR (+EV) — {data_hoje}</b>\n"]
-
-    if df_destaques.empty:
-        linhas.append(
-            f"Foram analisados <b>{len(df_jogos)} jogos</b> hoje, mas nenhum apresentou Edge ≥ +5% em Over 2.5 Gols."
+    if df_jogos.empty:
+        enviar_telegram_texto(
+            tg_token,
+            tg_chat,
+            f"⚽ <b>SCANNER MATINAL DE FUTEBOL — {data_hoje}</b>\n\nSem jogos das ligas monitoradas nas próximas 30 horas.",
         )
-    else:
-        linhas.append(f"🔥 <b>{len(df_destaques)} jogos com Edge positivo encontrados:</b>\n")
+        return
+
+    df_jogos = df_jogos.sort_values(by=["edge_over25_%", "horario_brt"], ascending=[False, True], na_position="last")
+    df_destaques = df_jogos[df_jogos["edge_over25_%"].notna() & (df_jogos["edge_over25_%"] >= 5.0)]
+
+    blocos = [f"⚽ <b>SCANNER MATINAL DE FUTEBOL — {data_hoje}</b>\n<i>{len(df_jogos)} jogo(s) analisado(s) nas próximas 30h</i>"]
+
+    # 1. Bloco de Oportunidades +EV (se houver)
+    if not df_destaques.empty:
+        dest_txt = [f"🔥 <b>DESTAQUES COM VALOR (+EV ≥ 5%):</b>"]
         for _, r in df_destaques.iterrows():
             jogo = html.escape(str(r["jogo"]))
-            liga = html.escape(str(r["liga"]))
-            linhas.append(
-                f"• <b>{jogo}</b> ({liga} • {r['horario_brt']})\n"
-                f"  Odd Over 2.5: <b>@{r['odd_over25']}</b> | Hist: <b>{r['prob_over25_est_%']}%</b> "
-                f"(Edge: <b>+{r['edge_over25_%']}%</b> | BTTS: {r['prob_btts_est_%']}%)"
+            dest_txt.append(
+                f"• <b>{jogo}</b> ({r['horario_brt']})\n"
+                f"  Over 2.5: <b>{formatar_odd(r['odd_over25'])}</b> | Hist: <b>{formatar_pct(r['prob_over25_est_%'])}</b> (Edge: <b>+{r['edge_over25_%']}%</b>)"
             )
+        blocos.append("\n".join(dest_txt))
 
-        if gemini_key:
-            client = genai.Client(http_options={"api_version": "v1beta"})
-            analise_ia = gerar_resumo_gemini(client, df_destaques.head(5))
-            if analise_ia:
-                linhas.append(f"\n🧠 <b>Leitura Rápida IA:</b>\n{analise_ia}")
+    # 2. Grade Completa de Todos os Jogos do Dia (substitui o Excel)
+    for liga, grupo in df_jogos.groupby("liga"):
+        liga_txt = [f"🏆 <b>{html.escape(str(liga))}</b>"]
+        for _, r in grupo.iterrows():
+            jogo = html.escape(str(r["jogo"]))
+            edge_str = f"{r['edge_over25_%']:+.1f}%" if pd.notna(r["edge_over25_%"]) else "-"
+            xg_str = f"{r['media_gols_projetada']:.2f}" if pd.notna(r["media_gols_projetada"]) else "-"
 
-    enviar_telegram_texto(tg_token, tg_chat, "\n".join(linhas))
-    enviar_telegram_arquivo(
-        tg_token,
-        tg_chat,
-        ARQUIVO_SAIDA,
-        f"📊 Grade completa ({len(df_jogos)} jogos) e métricas - {data_hoje}",
-    )
-    print("\n[Concluído] Boletim e planilha enviados para o Telegram!")
+            liga_txt.append(
+                f"⏰ <code>{r['horario_brt']}</code> — <b>{jogo}</b>\n"
+                f"   1x2: <code>{formatar_odd(r['odd_casa'])}</code> | <code>{formatar_odd(r['odd_empate'])}</code> | <code>{formatar_odd(r['odd_fora'])}</code>\n"
+                f"   Over 2.5: <b>{formatar_odd(r['odd_over25'])}</b> (Hist: {formatar_pct(r['prob_over25_est_%'])} | Edge: <b>{edge_str}</b>)\n"
+                f"   BTTS Hist: <b>{formatar_pct(r['prob_btts_est_%'])}</b> | Gols Proj.: <b>{xg_str}</b>"
+            )
+        blocos.append("\n\n".join(liga_txt))
+
+    # 3. Leitura Rápida da IA sobre a grade do dia
+    if gemini_key:
+        client = genai.Client(http_options={"api_version": "v1beta"})
+        analise_ia = gerar_resumo_gemini(client, df_jogos.head(10))
+        if analise_ia:
+            blocos.append(f"🧠 <b>Leitura Rápida IA:</b>\n{analise_ia}")
+
+    mensagem_final = "\n\n".join(blocos)
+    enviar_telegram_texto(tg_token, tg_chat, mensagem_final)
+    print("\n[Concluído] Grade completa enviada em texto direto no Telegram!")
 
 
 if __name__ == "__main__":
