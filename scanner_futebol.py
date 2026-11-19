@@ -416,13 +416,21 @@ def gerar_resumo_gemini(client: genai.Client, df_jogos: pd.DataFrame) -> str:
     
     {tabela_txt}
     
-    Escreva uma leitura rápida e objetiva em português (máximo 10 linhas, usando apenas tags HTML <b> e <i> para Telegram)
-    destacando os jogos mais interessantes do dia (seja para Over 2.5, Ambas Marcam ou favoritismo com valor) com base nos números.
-    Direto ao ponto, sem saudações ou introduções genéricas.
+    Escreva exatamente 3 ou 4 tópicos curtos em português destacando os melhores cenários do dia
+    (Over 2.5 com valor, Ambas Marcam forte ou favoritismo claro).
+    
+    REGRAS ESTRITAS DE FORMATAÇÃO:
+    - Use APENAS tags HTML <b> e <i>.
+    - NUNCA use asteriscos (*), cerquilhas (#) ou traços de Markdown.
+    - Comece cada tópico com "• " seguido do nome do jogo em <b>negrito</b>.
+    - Não coloque título nem saudação no início.
     """
     try:
         resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        return resp.text.strip()
+        texto = resp.text.strip()
+        texto = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", texto)
+        texto = re.sub(r"\*(.*?)\*", r"<i>\1</i>", texto)
+        return texto
     except Exception as e:
         print(f"[!] Erro ao gerar comentário Gemini: {e}")
         return ""
@@ -460,8 +468,9 @@ def main():
         )
         return
 
-    df_jogos = df_jogos.sort_values(by=["edge_over25_%", "horario_brt"], ascending=[False, True], na_position="last")
-    df_destaques = df_jogos[df_jogos["edge_over25_%"].notna() & (df_jogos["edge_over25_%"] >= 5.0)]
+    df_destaques = df_jogos[df_jogos["edge_over25_%"].notna() & (df_jogos["edge_over25_%"] >= 5.0)].sort_values(
+        by="edge_over25_%", ascending=False
+    )
 
     blocos = [
         f"⚽ <b>SCANNER MATINAL DE FUTEBOL — {data_hoje}</b>\n<i>{len(df_jogos)} jogo(s) analisado(s) nas próximas 30h</i>"
@@ -478,17 +487,26 @@ def main():
         blocos.append("\n".join(dest_txt))
 
     for liga, grupo in df_jogos.groupby("liga"):
+        grupo_ord = grupo.sort_values(by="horario_brt", ascending=True)
         liga_txt = [f"🏆 <b>{html.escape(str(liga))}</b>"]
-        for _, r in grupo.iterrows():
+        for _, r in grupo_ord.iterrows():
             jogo = html.escape(str(r["jogo"]))
-            edge_str = f"{r['edge_over25_%']:+.1f}%" if pd.notna(r["edge_over25_%"]) else "-"
+            edge_val = r["edge_over25_%"]
+            if pd.notna(edge_val):
+                sinal_edge = " ✅" if edge_val > 0 else ""
+                edge_str = f"{edge_val:+.1f}%{sinal_edge}"
+            else:
+                edge_str = "-"
+
+            btts_val = r["prob_btts_est_%"]
+            sinal_btts = " 🔥" if pd.notna(btts_val) and btts_val >= 65.0 else ""
             xg_str = f"{r['media_gols_projetada']:.2f}" if pd.notna(r["media_gols_projetada"]) else "-"
 
             liga_txt.append(
                 f"⏰ <code>{r['horario_brt']}</code> — <b>{jogo}</b>\n"
                 f"   1x2: <code>{formatar_odd(r['odd_casa'])}</code> | <code>{formatar_odd(r['odd_empate'])}</code> | <code>{formatar_odd(r['odd_fora'])}</code>\n"
                 f"   Over 2.5: <b>{formatar_odd(r['odd_over25'])}</b> (Hist: {formatar_pct(r['prob_over25_est_%'])} | Edge: <b>{edge_str}</b>)\n"
-                f"   BTTS Hist: <b>{formatar_pct(r['prob_btts_est_%'])}</b> | Gols Proj.: <b>{xg_str}</b>"
+                f"   BTTS Hist: <b>{formatar_pct(btts_val)}{sinal_btts}</b> | Gols Proj.: <b>{xg_str}</b>"
             )
         blocos.append("\n\n".join(liga_txt))
 
