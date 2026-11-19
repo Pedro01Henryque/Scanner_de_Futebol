@@ -4,7 +4,7 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import List, Optional
 
 import gspread
 import requests
@@ -14,20 +14,26 @@ from google.oauth2.service_account import Credentials
 from pydantic import BaseModel
 
 # ==============================================================================
-# CONFIGURAÇÕES DO RASTREADOR DE BANCA (COLUNAS A:F + RESULTADO EM H)
+# CONFIGURAÇÕES DO RASTREADOR DE BANCA (COLUNAS A:F + STATUS "ABERTO" EM H)
 # ==============================================================================
 
 GEMINI_MODEL = "gemini-2.5-flash"
 ABA_PLANILHA = "Página1"
 
 
+class SelecaoBilhete(BaseModel):
+    evento: str
+    mercado: str
+    odd: float
+
+
 class ApostaExtraida(BaseModel):
     casa_aposta: str
     esporte: str
-    descricao_aposta: str
-    odd: float
+    selecoes: List[SelecaoBilhete]
+    odd_total_explicitamente_visivel: Optional[float] = None
     valor_apostado: float
-    resultado: str  # "Pendente", "Green", "Red" ou "Void"
+    resultado: str  # "Aberto", "Green", "Red" ou "Void"
 
 
 # ==============================================================================
@@ -55,11 +61,17 @@ def primeira_linha_vazia_col_a(ws) -> int:
     return len(valores_col_a) + 1
 
 
-def formatar_brl(valor: float) -> str:
+def formatar_brl_mensagem(valor: float) -> str:
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def formatar_decimal_br(valor: float) -> str:
+def formatar_valor_planilha(valor: float) -> str:
+    """Formata com 2 casas decimais e vírgula, SEM 'R$' (ex: 5,99 ou 5,00)."""
+    return f"{valor:.2f}".replace(".", ",")
+
+
+def formatar_odd_planilha(valor: float) -> str:
+    """Formata odd com vírgula decimal (ex: 3,36 ou 2,5)."""
     return f"{valor:.2f}".rstrip("0").rstrip(".").replace(".", ",")
 
 
@@ -164,7 +176,7 @@ def buscar_mensagens_novas(token: str, chat_id_autorizado: str) -> list:
 
 
 # ==============================================================================
-# PARSING MULTIMODAL COM GEMINI (LEITURA DETALHADA DO BILHETE)
+# PARSING MULTIMODAL COM GEMINI (TODAS AS SELEÇÕES + CÁLCULO DE ODD EM PYTHON)
 # ==============================================================================
 
 def interpretar_aposta_gemini(
@@ -174,26 +186,24 @@ def interpretar_aposta_gemini(
     mime_type: str = "image/jpeg",
 ) -> Optional[ApostaExtraida]:
     prompt = f"""
-    Você é um auditor preciso de bilhetes de apostas esportivas.
-    Analise cuidadosamente a imagem anexada (se houver) e a legenda do usuário abaixo para extrair TODOS os detalhes sem omitir nenhuma informação.
+    Você é um auditor meticuloso de bilhetes de apostas esportivas.
+    Analise a imagem inteira (do topo até a borda inferior antes da barra de navegação) e a legenda do usuário.
 
-    Legenda/Texto enviado pelo usuário: "{texto_usuario}"
+    Legenda/Texto do usuário: "{texto_usuario}"
 
-    INSTRUÇÕES DE LEITURA CRÍTICA:
-    1. Varra a imagem de cima para baixo, linha por linha. Não ignore nenhuma seleção, time ou mercado.
-    2. casa_aposta: Identifique pelo texto do usuário ou pelo logotipo/domínio na imagem (ex: Stake, Betano, Bet365, Betfair, Superbet, Novibet). Padronize com inicial maiúscula (ex: "Stake").
-    3. esporte: Identifique pelos ícones ou nomes dos times/ligas (ex: "Futebol", "NBA", "NFL", "Tênis").
-    4. descricao_aposta:
-       - Nunca resuma nem corte nomes de times ou mercados.
-       - Se houver 1 seleção (simples): escreva "<Time Casa> x <Time Visitante> - <Mercado exato>" (ex: "CR Vasco da Gama RJ x SC Internacional - Menos de 2.5 Gols").
-       - Se houver 2 ou mais seleções (múltipla/combinada): escreva "Múltipla (<N> seleções): " seguido de TODAS as seleções completas separadas por " | " no formato "<Time Casa> x <Time Visitante> (<Mercado exato> @<odd>)" (ex: "Múltipla (2 seleções): CR Vasco da Gama RJ x SC Internacional (Menos de 2.5 @2.13) | EC Vitória BA x RB Bragantino (Menos de 2.5 @2.00)").
-    5. odd:
-       - Se houver uma odd total explícita no bilhete, use ela.
-       - Se for múltipla e aparecerem apenas as odds individuais de cada seleção, MULTIPLIQUE todas elas entre si e arredonde para 2 casas decimais (ex: 2.13 * 2.00 = 4.26).
-    6. valor_apostado:
-       - Extraia o valor numérico apostado em reais (ex: se o usuário escreveu "valor: 5,00" ou "5", retorne 5.0). Nunca confunda o saldo da conta no topo da tela (ex: R$ 55,00) com o valor apostado!
-    7. resultado:
-       - Retorne "Green", "Red", "Void" ou "Pendente". Se estiver em "Apostas ativas" ou sem desfecho informado, retorne "Pendente".
+    REGRAS OBRIGATÓRIAS DE EXTRAÇÃO:
+    1. VARREDURA COMPLETA DE SELEÇÕES (lista `selecoes`):
+       - Olhe cada bloco/linha do bilhete de cima para baixo, inclusive a última linha próxima ao rodapé da imagem!
+       - Para CADA seleção encontrada no bilhete (1, 2, 3 ou mais seleções), adicione um item separado em `selecoes`:
+         * `evento`: Nome completo dos dois times/jogadores separados por " x " (ex: "Shelton, Ben x Rafael Jodar", "Harri Heliovaara / Patten H x Arribage T / Olivetti A"). Se na parte inferior da imagem aparecer apenas a escolha e o mercado (ex: "Zverev, Alexander/Zverev, Alexander - Hipótese dupla (1° set/partida)") porque o confronto ficou cortado abaixo, coloque a escolha no campo `evento`!
+         * `mercado`: Escolha + mercado exato (ex: "Shelton, Ben - Vencedor", "Menos de 2.5", "Hipótese dupla (1° set/partida)").
+         * `odd`: Odd decimal individual daquela seleção (ex: 1.33, 1.58, 1.60).
+       - NUNCA pare na primeira seleção se houver outras abaixo dela!
+    2. `casa_aposta`: Nome da casa (ex: Stake, Betano, Bet365, Betfair, Superbet). Identifique pela legenda ou logotipo/URL na imagem.
+    3. `esporte`: Esporte principal (ex: Tênis, Futebol, NBA, NFL).
+    4. `odd_total_explicitamente_visivel`: Preencha APENAS se houver um campo escrito "Odd total" ou "Cotações totais" no bilhete; caso contrário deixe null (o Python multiplicará `selecoes` automaticamente).
+    5. `valor_apostado`: Valor apostado informado na legenda ou no campo de aposta do bilhete (ex: 5.0 ou 5.99). NUNCA pegue o saldo da carteira no topo da tela (ex: R$ 55,00)!
+    6. `resultado`: Retorne EXATAMENTE "Aberto", "Green", "Red" ou "Void". Se estiver em "Apostas ativas" ou sem resultado final explícito na legenda, retorne "Aberto".
     """
 
     conteudos = [prompt]
@@ -207,7 +217,7 @@ def interpretar_aposta_gemini(
             config={
                 "response_mime_type": "application/json",
                 "response_schema": ApostaExtraida,
-                "temperature": 0.1,
+                "temperature": 0.05,
             },
         )
         return ApostaExtraida.model_validate_json(resp.text)
@@ -216,12 +226,36 @@ def interpretar_aposta_gemini(
         return None
 
 
-def atualizar_ultima_pendente(ws, novo_resultado: str) -> str:
-    """Atualiza APENAS a coluna H (Resultado) da última aposta Pendente, preservando fórmulas em G, I e J."""
+def montar_descricao_e_odd_total(aposta: ApostaExtraida) -> tuple[str, float]:
+    selecoes = aposta.selecoes or []
+    if len(selecoes) == 1:
+        s = selecoes[0]
+        descricao = f"{s.evento} - {s.mercado}"
+        odd_calculada = s.odd
+    else:
+        partes = []
+        produto_odds = 1.0
+        for s in selecoes:
+            partes.append(f"{s.evento} ({s.mercado} @{s.odd:.2f})")
+            if s.odd > 0:
+                produto_odds *= s.odd
+        descricao = f"Múltipla ({len(selecoes)} seleções): " + " | ".join(partes)
+        odd_calculada = round(produto_odds, 2)
+
+    if aposta.odd_total_explicitamente_visivel and aposta.odd_total_explicitamente_visivel > 1.0:
+        odd_final = round(aposta.odd_total_explicitamente_visivel, 2)
+    else:
+        odd_final = round(odd_calculada, 2)
+
+    return descricao, odd_final
+
+
+def atualizar_ultima_aberta(ws, novo_resultado: str) -> str:
+    """Atualiza APENAS a coluna H (Resultado) da última aposta com status 'Aberto'."""
     todas_linhas = ws.get_all_values()
     for idx in range(len(todas_linhas) - 1, 0, -1):
         linha = todas_linhas[idx]
-        if len(linha) >= 8 and linha[0].strip() and linha[7].strip().lower() == "pendente":
+        if len(linha) >= 8 and linha[0].strip() and linha[7].strip().lower() in ("aberto", "pendente"):
             numero_linha = idx + 1
             res_norm = novo_resultado.strip().capitalize()
 
@@ -237,7 +271,7 @@ def atualizar_ultima_pendente(ws, novo_resultado: str) -> str:
                 f"🏷️ Status: <b>{res_norm}</b> | Odd: <code>{linha[4]}</code> | Stake: <b>{linha[5]}</b>"
             )
 
-    return "⚠️ Nenhuma aposta com status <b>Pendente</b> encontrada na planilha para atualizar."
+    return "⚠️ Nenhuma aposta com status <b>Aberto</b> encontrada na planilha para atualizar."
 
 
 def gerar_relatorio_banca(ws, titulo: str = "📊 RESUMO DE BANCA & ROI") -> str:
@@ -252,7 +286,7 @@ def gerar_relatorio_banca(ws, titulo: str = "📊 RESUMO DE BANCA & ROI") -> str
     lucro_liquido_geral = 0.0
     greens_geral = 0
     reds_geral = 0
-    pendentes = 0
+    abertas = 0
     entradas_validas = 0
 
     total_apostado_mes = 0.0
@@ -269,8 +303,8 @@ def gerar_relatorio_banca(ws, titulo: str = "📊 RESUMO DE BANCA & ROI") -> str
         resultado = linha[7].strip().capitalize()
         lucro_col = parse_moeda_br(linha[8]) if len(linha) >= 9 else 0.0
 
-        if resultado == "Pendente":
-            pendentes += 1
+        if resultado in ("Aberto", "Pendente"):
+            abertas += 1
             continue
         if resultado not in ("Green", "Red", "Void"):
             continue
@@ -299,14 +333,14 @@ def gerar_relatorio_banca(ws, titulo: str = "📊 RESUMO DE BANCA & ROI") -> str
     return (
         f"<b>{titulo}</b>\n\n"
         f"📅 <b>Mês Atual ({agora_brt.strftime('%m/%Y')}):</b>\n"
-        f"• Volume Apostado: <b>{formatar_brl(total_apostado_mes)}</b>\n"
-        f"• Lucro Líquido: <b>{formatar_brl(lucro_liquido_mes)}</b> (ROI: <b>{roi_mes:+.1f}%</b>)\n"
+        f"• Volume Apostado: <b>{formatar_brl_mensagem(total_apostado_mes)}</b>\n"
+        f"• Lucro Líquido: <b>{formatar_brl_mensagem(lucro_liquido_mes)}</b> (ROI: <b>{roi_mes:+.1f}%</b>)\n"
         f"• Placar: <b>{greens_mes}G</b> / <b>{reds_mes}R</b>\n\n"
         f"🏦 <b>Acumulado Histórico ({entradas_validas} entradas):</b>\n"
-        f"• Volume Total: <b>{formatar_brl(total_apostado_geral)}</b>\n"
-        f"• Lucro Líquido: <b>{formatar_brl(lucro_liquido_geral)}</b> (ROI: <b>{roi_geral:+.2f}%</b>)\n"
+        f"• Volume Total: <b>{formatar_brl_mensagem(total_apostado_geral)}</b>\n"
+        f"• Lucro Líquido: <b>{formatar_brl_mensagem(lucro_liquido_geral)}</b> (ROI: <b>{roi_geral:+.2f}%</b>)\n"
         f"• Taxa de Acerto: <b>{winrate_geral:.1f}%</b> ({greens_geral}G / {reds_geral}R)\n"
-        f"• Apostas Pendentes: <b>{pendentes}</b>"
+        f"• Apostas em Aberto: <b>{abertas}</b>"
     )
 
 
@@ -322,13 +356,13 @@ def processar_mensagem(
     if not foto_bytes:
         if txt_lower in ("/start", "/ajuda", "ajuda"):
             return (
-                "🤖 <b>Rastreador de Banca Ativo (Colunas A:F)!</b>\n\n"
+                "🤖 <b>Rastreador de Banca Ativo!</b>\n\n"
                 "<b>1. Por foto:</b> Mande o print do bilhete com a legenda:\n"
-                "<code>casa: Stake | valor: 5,00</code>\n\n"
+                "<code>casa: Stake | valor: 5,99</code>\n\n"
                 "<b>2. Por texto:</b>\n"
-                "<code>Stake | Futebol | Vasco x Inter Under 2.5 | @2.13 | R$ 5</code>\n\n"
+                "<code>Stake | Tênis | Shelton Vencedor | @1.33 | 5,99</code>\n\n"
                 "<b>Outros comandos:</b>\n"
-                "• <code>Green</code> / <code>Red</code> / <code>Void</code> — preenche Coluna H da última pendente\n"
+                "• <code>Green</code> / <code>Red</code> / <code>Void</code> — fecha a última aposta em Aberto\n"
                 "• <code>/resumo</code> — exibe ROI e lucro do mês e histórico"
             )
 
@@ -337,27 +371,31 @@ def processar_mensagem(
 
         if txt_lower in ("green", "red", "void", "reembolso"):
             status = "Void" if txt_lower == "reembolso" else txt_lower.capitalize()
-            return atualizar_ultima_pendente(ws, status)
+            return atualizar_ultima_aberta(ws, status)
 
     aposta = interpretar_aposta_gemini(client, texto, foto_bytes, mime_type)
-    if not aposta or aposta.odd <= 1.0 or aposta.valor_apostado <= 0:
+    if not aposta or not aposta.selecoes or aposta.valor_apostado <= 0:
         return (
-            "⚠️ Não consegui identificar a <b>Odd</b> ou o <b>Valor Apostado</b>.\n"
-            "Ao mandar print, escreva na legenda: <code>casa: Stake | valor: 5,00</code>"
+            "⚠️ Não consegui identificar as seleções ou o <b>Valor Apostado</b>.\n"
+            "Ao mandar print, escreva na legenda: <code>casa: Stake | valor: 5,99</code>"
         )
+
+    descricao_final, odd_final = montar_descricao_e_odd_total(aposta)
+    if odd_final <= 1.0:
+        return "⚠️ Odd total inválida (menor ou igual a 1.00). Verifique o print ou informe na legenda."
 
     agora_brt = datetime.now(timezone.utc) - timedelta(hours=3)
     data_hoje = agora_brt.strftime("%d/%m/%Y")
     linha_destino = primeira_linha_vazia_col_a(ws)
 
-    # Grava ESTRITAMENTE nas colunas A até F para não sobrescrever fórmulas de G até J
+    # Colunas A até F (Coluna F recebe valor numérico com vírgula SEM "R$", ex: 5,99)
     valores_a_f = [[
         data_hoje,
         aposta.casa_aposta,
         aposta.esporte,
-        aposta.descricao_aposta,
-        formatar_decimal_br(aposta.odd),
-        formatar_brl(aposta.valor_apostado),
+        descricao_final,
+        formatar_odd_planilha(odd_final),
+        formatar_valor_planilha(aposta.valor_apostado),
     ]]
     ws.update(
         f"A{linha_destino}:F{linha_destino}",
@@ -365,23 +403,27 @@ def processar_mensagem(
         value_input_option="USER_ENTERED",
     )
 
-    # Se o usuário já informou um resultado explícito (ex: Green/Red), grava também em H
+    # Coluna H recebe "Aberto", "Green", "Red" ou "Void"
     res_norm = aposta.resultado.strip().capitalize()
-    if res_norm in ("Green", "Red", "Void", "Pendente"):
-        ws.update(
-            f"H{linha_destino}",
-            [[res_norm]],
-            value_input_option="USER_ENTERED",
-        )
+    if res_norm == "Pendente":
+        res_norm = "Aberto"
+    if res_norm not in ("Aberto", "Green", "Red", "Void"):
+        res_norm = "Aberto"
 
-    retorno_previsto = round(aposta.valor_apostado * aposta.odd, 2)
+    ws.update(
+        f"H{linha_destino}",
+        [[res_norm]],
+        value_input_option="USER_ENTERED",
+    )
+
+    retorno_previsto = round(aposta.valor_apostado * odd_final, 2)
 
     return (
-        f"📝 <b>Entrada Gravada em A{linha_destino}:F{linha_destino}:</b>\n"
+        f"📝 <b>Entrada Gravada na Linha {linha_destino}:</b>\n"
         f"🏛️ {html.escape(aposta.casa_aposta)} • 🏆 {html.escape(aposta.esporte)}\n"
-        f"📌 <b>{html.escape(aposta.descricao_aposta)}</b>\n"
-        f"🎯 Odd Total: <b>@{aposta.odd:.2f}</b> | Stake: <b>{formatar_brl(aposta.valor_apostado)}</b>\n"
-        f"💵 Retorno Previsto: <b>{formatar_brl(retorno_previsto)}</b> | Status (Col H): <b>{res_norm}</b>"
+        f"📌 <b>{html.escape(descricao_final)}</b>\n"
+        f"🎯 Odd Total: <b>@{odd_final:.2f}</b> | Stake: <b>{formatar_valor_planilha(aposta.valor_apostado)}</b>\n"
+        f"💵 Retorno Previsto: <b>{formatar_brl_mensagem(retorno_previsto)}</b> | Status (Col H): <b>{res_norm}</b>"
     )
 
 
