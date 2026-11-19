@@ -1,6 +1,7 @@
 import html
 import os
 import re
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -14,6 +15,7 @@ from google import genai
 # ==============================================================================
 
 GEMINI_MODEL = "gemini-2.5-flash"
+EDGE_MINIMO_PCT = 2.0  # Filtra apenas oportunidades com Edge >= +2.0% (Over 2.5 ou Under 2.5)
 
 LIGAS_ALVO = [
     {
@@ -311,7 +313,7 @@ def extrair_melhores_odds_evento(evento: dict) -> dict:
 
 
 # ==============================================================================
-# MOTOR DE CRUZAMENTO E CÁLCULO DE +EV
+# MOTOR DE CRUZAMENTO E CÁLCULO DE +EV (OVER 2.5 & UNDER 2.5)
 # ==============================================================================
 
 def encontrar_stats_time(nome_api: str, base_stats: Dict[str, dict]) -> Optional[dict]:
@@ -362,6 +364,7 @@ def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
 
             if st_home and st_away:
                 prob_over25_est = round((st_home["casa_over25_%"] + st_away["fora_over25_%"]) / 2, 1)
+                prob_under25_est = round(100.0 - prob_over25_est, 1)
                 prob_btts_est = round((st_home["casa_btts_%"] + st_away["fora_btts_%"]) / 2, 1)
                 xg_projetado = round(
                     (
@@ -375,14 +378,34 @@ def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
                 )
             else:
                 prob_over25_est = None
+                prob_under25_est = None
                 prob_btts_est = None
                 xg_projetado = None
 
-            ev_over25_pct = None
-            prob_implicita_over = None
-            if prob_over25_est and odds["odd_over25"]:
-                prob_implicita_over = round((1 / odds["odd_over25"]) * 100, 1)
-                ev_over25_pct = round(prob_over25_est - prob_implicita_over, 1)
+            ev_over25 = None
+            if prob_over25_est is not None and odds["odd_over25"]:
+                ev_over25 = round(prob_over25_est - (1 / odds["odd_over25"]) * 100, 1)
+
+            ev_under25 = None
+            if prob_under25_est is not None and odds["odd_under25"]:
+                ev_under25 = round(prob_under25_est - (1 / odds["odd_under25"]) * 100, 1)
+
+            # Define qual lado tem o maior Edge positivo
+            melhor_mercado = None
+            melhor_odd = None
+            melhor_prob_hist = None
+            melhor_edge = None
+
+            if ev_over25 is not None and ev_over25 >= EDGE_MINIMO_PCT and (ev_under25 is None or ev_over25 >= ev_under25):
+                melhor_mercado = "Over 2.5 Gols"
+                melhor_odd = odds["odd_over25"]
+                melhor_prob_hist = prob_over25_est
+                melhor_edge = ev_over25
+            elif ev_under25 is not None and ev_under25 >= EDGE_MINIMO_PCT:
+                melhor_mercado = "Under 2.5 Gols"
+                melhor_odd = odds["odd_under25"]
+                melhor_prob_hist = prob_under25_est
+                melhor_edge = ev_under25
 
             registros.append(
                 {
@@ -392,10 +415,10 @@ def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
                     "odd_casa": odds["odd_casa"],
                     "odd_empate": odds["odd_empate"],
                     "odd_fora": odds["odd_fora"],
-                    "odd_over25": odds["odd_over25"],
-                    "prob_over25_est_%": prob_over25_est,
-                    "prob_implicita_odd_%": prob_implicita_over,
-                    "edge_over25_%": ev_over25_pct,
+                    "mercado_valor": melhor_mercado,
+                    "odd_valor": melhor_odd,
+                    "prob_hist_%": melhor_prob_hist,
+                    "edge_%": melhor_edge,
                     "prob_btts_est_%": prob_btts_est,
                     "media_gols_projetada": xg_projetado,
                 }
@@ -405,19 +428,22 @@ def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
 
 
 # ==============================================================================
-# SÍNTESE COM GEMINI E DISPARO EM TEXTO PURO NO TELEGRAM
+# SÍNTESE COM GEMINI E DISPARO FILTRADO NO TELEGRAM
 # ==============================================================================
 
-def gerar_resumo_gemini(client: genai.Client, df_jogos: pd.DataFrame) -> str:
-    tabela_txt = df_jogos.to_string(index=False)
+def gerar_resumo_gemini(client: genai.Client, df_filtrados: pd.DataFrame) -> str:
+    tabela_txt = df_filtrados[
+        ["liga", "jogo", "mercado_valor", "odd_valor", "prob_hist_%", "edge_%", "prob_btts_est_%", "media_gols_projetada"]
+    ].to_string(index=False)
+
     prompt = f"""
     Você é um analista quantitativo de apostas esportivas.
-    Analise esta grade de jogos do dia com suas odds e métricas estatísticas:
+    Analise estas oportunidades filtradas hoje com Edge positivo (+EV):
     
     {tabela_txt}
     
-    Escreva exatamente 3 ou 4 tópicos curtos em português destacando os melhores cenários do dia
-    (Over 2.5 com valor, Ambas Marcam forte ou favoritismo claro).
+    Para CADA jogo da tabela, escreva 1 tópico curto e direto em português validando a entrada
+    (explicando por que o histórico, a odd e a projeção de gols sustentam o valor ou se há algum ponto de atenção).
     
     REGRAS ESTRITAS DE FORMATAÇÃO:
     - Use APENAS tags HTML <b> e <i>.
@@ -425,15 +451,19 @@ def gerar_resumo_gemini(client: genai.Client, df_jogos: pd.DataFrame) -> str:
     - Comece cada tópico com "• " seguido do nome do jogo em <b>negrito</b>.
     - Não coloque título nem saudação no início.
     """
-    try:
-        resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        texto = resp.text.strip()
-        texto = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", texto)
-        texto = re.sub(r"\*(.*?)\*", r"<i>\1</i>", texto)
-        return texto
-    except Exception as e:
-        print(f"[!] Erro ao gerar comentário Gemini: {e}")
-        return ""
+    for tentativa in range(2):
+        try:
+            resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            if resp and resp.text:
+                texto = resp.text.strip()
+                texto = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", texto)
+                texto = re.sub(r"\*(.*?)\*", r"<i>\1</i>", texto)
+                return texto
+        except Exception as e:
+            print(f"[!] Tentativa {tentativa + 1} Gemini falhou: {e}")
+            time.sleep(3)
+
+    return "<i>Leitura IA indisponível momentaneamente.</i>"
 
 
 def formatar_odd(val) -> str:
@@ -453,78 +483,65 @@ def main():
     if not odds_key:
         raise EnvironmentError("Defina ODDS_API_KEY nos Secrets do GitHub.")
 
-    df_jogos = analisar_oportunidades_dia(odds_key)
+    df_todos = analisar_oportunidades_dia(odds_key)
     data_hoje = datetime.now().strftime("%d/%m/%Y")
 
     if not tg_token or not tg_chat:
         print("[Aviso] Telegram não configurado.")
         return
 
-    if df_jogos.empty:
+    total_analisados = len(df_todos)
+
+    if total_analisados == 0:
         enviar_telegram_texto(
             tg_token,
             tg_chat,
-            f"⚽ <b>SCANNER MATINAL DE FUTEBOL — {data_hoje}</b>\n\nSem jogos das ligas monitoradas nas próximas 30 horas.",
+            f"⚽ <b>SCANNER +EV FUTEBOL — {data_hoje}</b>\n\nSem jogos das ligas monitoradas nas próximas 30 horas.",
+        )
+        return
+
+    df_valor = df_todos[df_todos["edge_%"].notna()].sort_values(by="edge_%", ascending=False)
+
+    if df_valor.empty:
+        enviar_telegram_texto(
+            tg_token,
+            tg_chat,
+            f"⚽ <b>SCANNER +EV FUTEBOL — {data_hoje}</b>\n"
+            f"<i>{total_analisados} jogo(s) varrido(s) nas 8 ligas</i>\n\n"
+            f"📭 Nenhuma oportunidade com Edge ≥ +{EDGE_MINIMO_PCT:.0f}% encontrada hoje.",
         )
         return
 
     blocos = [
-        f"⚽ <b>SCANNER MATINAL DE FUTEBOL — {data_hoje}</b>\n<i>{len(df_jogos)} jogo(s) analisado(s) nas próximas 30h</i>"
+        f"⚽ <b>SCANNER +EV FUTEBOL — {data_hoje}</b>\n"
+        f"<i>{len(df_valor)} oportunidade(s) com Edge ≥ +{EDGE_MINIMO_PCT:.0f}% (de {total_analisados} jogos analisados)</i>"
     ]
 
-    # 1. Grade completa organizada por liga e ordem cronológica
-    for liga, grupo in df_jogos.groupby("liga"):
-        grupo_ord = grupo.sort_values(by="horario_brt", ascending=True)
-        liga_txt = [f"🏆 <b>{html.escape(str(liga))}</b>"]
-        for _, r in grupo_ord.iterrows():
-            jogo = html.escape(str(r["jogo"]))
-            edge_val = r["edge_over25_%"]
-            if pd.notna(edge_val):
-                sinal_edge = " ✅" if edge_val > 0 else ""
-                edge_str = f"{edge_val:+.1f}%{sinal_edge}"
-            else:
-                edge_str = "-"
+    # Lista apenas os jogos com Edge Positivo ordenados do maior Edge para o menor
+    for _, r in df_valor.iterrows():
+        jogo = html.escape(str(r["jogo"]))
+        liga = html.escape(str(r["liga"]))
+        mercado = html.escape(str(r["mercado_valor"]))
+        xg_str = f"{r['media_gols_projetada']:.2f}" if pd.notna(r["media_gols_projetada"]) else "-"
 
-            btts_val = r["prob_btts_est_%"]
-            sinal_btts = " 🔥" if pd.notna(btts_val) and btts_val >= 65.0 else ""
-            xg_str = f"{r['media_gols_projetada']:.2f}" if pd.notna(r["media_gols_projetada"]) else "-"
+        blocos.append(
+            f"✅ <b>{jogo}</b>\n"
+            f"🏆 {liga} • ⏰ <code>{r['horario_brt']}</code>\n"
+            f"🎯 Entrada: <b>{mercado}</b> @ <b>{formatar_odd(r['odd_valor'])}</b>\n"
+            f"📊 Hist: <b>{formatar_pct(r['prob_hist_%'])}</b> | Edge: <b>+{r['edge_%']:.1f}%</b> | BTTS: {formatar_pct(r['prob_btts_est_%'])} | Gols Proj.: <b>{xg_str}</b>\n"
+            f"⚖️ 1x2: <code>{formatar_odd(r['odd_casa'])}</code> | <code>{formatar_odd(r['odd_empate'])}</code> | <code>{formatar_odd(r['odd_fora'])}</code>"
+        )
 
-            liga_txt.append(
-                f"⏰ <code>{r['horario_brt']}</code> — <b>{jogo}</b>\n"
-                f"   1x2: <code>{formatar_odd(r['odd_casa'])}</code> | <code>{formatar_odd(r['odd_empate'])}</code> | <code>{formatar_odd(r['odd_fora'])}</code>\n"
-                f"   Over 2.5: <b>{formatar_odd(r['odd_over25'])}</b> (Hist: {formatar_pct(r['prob_over25_est_%'])} | Edge: <b>{edge_str}</b>)\n"
-                f"   BTTS Hist: <b>{formatar_pct(btts_val)}{sinal_btts}</b> | Gols Proj.: <b>{xg_str}</b>"
-            )
-        blocos.append("\n\n".join(liga_txt))
-
-    # 2. Leitura Rápida IA
+    # Leitura Rápida IA focada apenas nos jogos filtrados
     if gemini_key:
         client = genai.Client(http_options={"api_version": "v1beta"})
-        analise_ia = gerar_resumo_gemini(client, df_jogos.head(12))
+        analise_ia = gerar_resumo_gemini(client, df_valor.head(10))
         if analise_ia:
             blocos.append(f"🧠 <b>Leitura Rápida IA:</b>\n{analise_ia}")
 
-    # 3. Resumo final apenas com os jogos de Edge Positivo (> 0%)
-    df_edge_positivo = df_jogos[df_jogos["edge_over25_%"].notna() & (df_jogos["edge_over25_%"] > 0)].sort_values(
-        by="edge_over25_%", ascending=False
-    )
-
-    if not df_edge_positivo.empty:
-        edge_txt = ["✅ <b>RESUMO — APENAS EDGE POSITIVO (Over 2.5):</b>"]
-        for _, r in df_edge_positivo.iterrows():
-            jogo = html.escape(str(r["jogo"]))
-            liga = html.escape(str(r["liga"]))
-            edge_txt.append(
-                f"• <b>{jogo}</b> ({liga} • <code>{r['horario_brt']}</code>)\n"
-                f"  Odd: <b>{formatar_odd(r['odd_over25'])}</b> | Hist: <b>{formatar_pct(r['prob_over25_est_%'])}</b> | Edge: <b>+{r['edge_over25_%']:.1f}%</b>"
-            )
-        blocos.append("\n".join(edge_txt))
-    else:
-        blocos.append("✅ <b>RESUMO — EDGE POSITIVO:</b>\n<i>Nenhum jogo com Edge positivo em Over 2.5 hoje.</i>")
-
     mensagem_final = "\n\n".join(blocos)
     enviar_telegram_texto(tg_token, tg_chat, mensagem_final)
-    print("\n[Concluído] Grade completa enviada em texto direto no Telegram!")
+    print(f"\n[Concluído] {len(df_valor)} oportunidade(s) com Edge positivo enviada(s)!")
 
 
 if __name__ == "__main__":
