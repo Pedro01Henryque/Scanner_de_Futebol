@@ -195,12 +195,12 @@ def interpretar_aposta_gemini(
     1. VARREDURA COMPLETA DE SELEÇÕES (lista `selecoes`):
        - Olhe cada bloco/linha do bilhete de cima para baixo, inclusive a última linha próxima ao rodapé da imagem!
        - Para CADA seleção encontrada no bilhete (1, 2, 3 ou mais seleções), adicione um item separado em `selecoes`:
-         * `evento`: Nome completo dos dois times/jogadores separados por " x " (ex: "Shelton, Ben x Rafael Jodar", "Harri Heliovaara / Patten H x Arribage T / Olivetti A"). Se na parte inferior da imagem aparecer apenas a escolha e o mercado (ex: "Zverev, Alexander/Zverev, Alexander - Hipótese dupla (1° set/partida)") porque o confronto ficou cortado abaixo, coloque a escolha no campo `evento`!
-         * `mercado`: Escolha + mercado exato (ex: "Shelton, Ben - Vencedor", "Menos de 2.5", "Hipótese dupla (1° set/partida)").
-         * `odd`: Odd decimal individual daquela seleção (ex: 1.33, 1.58, 1.60).
+         * `evento`: Nome completo dos dois times/jogadores separados por " x " (ex: "CR Vasco da Gama RJ x SC Internacional", "Shelton, Ben x Rafael Jodar"). Se na parte inferior da imagem aparecer apenas a escolha e o mercado (ex: "Zverev, Alexander/Zverev, Alexander") porque o confronto ficou cortado abaixo, coloque a escolha no campo `evento`!
+         * `mercado`: Mercado exato completo (ex: "Menos de 2.5 Gols", "Vencedor", "Hipótese dupla (1° set/partida)").
+         * `odd`: Odd decimal individual daquela seleção (ex: 2.13, 2.00, 1.33).
        - NUNCA pare na primeira seleção se houver outras abaixo dela!
     2. `casa_aposta`: Nome da casa (ex: Stake, Betano, Bet365, Betfair, Superbet). Identifique pela legenda ou logotipo/URL na imagem.
-    3. `esporte`: Esporte principal (ex: Tênis, Futebol, NBA, NFL).
+    3. `esporte`: Esporte principal (ex: Futebol, Tênis, NBA, NFL).
     4. `odd_total_explicitamente_visivel`: Preencha APENAS se houver um campo escrito "Odd total" ou "Cotações totais" no bilhete; caso contrário deixe null (o Python multiplicará `selecoes` automaticamente).
     5. `valor_apostado`: Valor apostado informado na legenda ou no campo de aposta do bilhete (ex: 5.0 ou 5.99). NUNCA pegue o saldo da carteira no topo da tela (ex: R$ 55,00)!
     6. `resultado`: Retorne EXATAMENTE "Aberto", "Green", "Red" ou "Void". Se estiver em "Apostas ativas" ou sem resultado final explícito na legenda, retorne "Aberto".
@@ -233,13 +233,13 @@ def montar_descricao_e_odd_total(aposta: ApostaExtraida) -> tuple[str, float]:
         descricao = f"{s.evento} - {s.mercado}"
         odd_calculada = s.odd
     else:
-        partes = []
+        linhas_selecoes = []
         produto_odds = 1.0
         for s in selecoes:
-            partes.append(f"{s.evento} ({s.mercado} @{s.odd:.2f})")
+            linhas_selecoes.append(f"{s.evento} ({s.mercado} @{s.odd:.2f})")
             if s.odd > 0:
                 produto_odds *= s.odd
-        descricao = f"Múltipla ({len(selecoes)} seleções): " + " | ".join(partes)
+        descricao = f"Múltipla ({len(selecoes)} seleções):\n" + "\n".join(linhas_selecoes)
         odd_calculada = round(produto_odds, 2)
 
     if aposta.odd_total_explicitamente_visivel and aposta.odd_total_explicitamente_visivel > 1.0:
