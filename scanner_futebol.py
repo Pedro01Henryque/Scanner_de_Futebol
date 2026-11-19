@@ -10,7 +10,7 @@ import requests
 from google import genai
 
 # ==============================================================================
-# CONFIGURAÇÕES DO SCANNER (BRASILEIRÃO + BIG 5 EUROPEIAS + CHAMPIONS LEAGUE)
+# CONFIGURAÇÕES DO SCANNER (BRASILEIRÃO + BIG 5 EUROPEIAS + CHAMPIONS + MLS)
 # ==============================================================================
 
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -20,6 +20,12 @@ LIGAS_ALVO = [
         "nome": "Brasileirão Série A",
         "odds_key": "soccer_brazil_campeonato",
         "csv_historico": "https://www.football-data.co.uk/new/BRA.csv",
+        "formato_novo": True,
+    },
+    {
+        "nome": "MLS (EUA)",
+        "odds_key": "soccer_usa_mls",
+        "csv_historico": "https://www.football-data.co.uk/new/USA.csv",
         "formato_novo": True,
     },
     {
@@ -55,7 +61,7 @@ LIGAS_ALVO = [
     {
         "nome": "UEFA Champions League",
         "odds_key": "soccer_uefa_champs_league",
-        "csv_historico": None,  # Usa a base consolidada das ligas domésticas
+        "csv_historico": None,
         "formato_novo": False,
     },
 ]
@@ -66,6 +72,36 @@ ALIASES_TIMES = {
     "athletico paranaense": "athletico-pr",
     "red bull bragantino": "bragantino",
     "vasco da gama": "vasco",
+    # MLS (EUA)
+    "inter miami cf": "inter miami",
+    "los angeles fc": "los angeles fc",
+    "la galaxy": "los angeles galaxy",
+    "new york city fc": "new york city",
+    "new york red bulls": "new york red bulls",
+    "atlanta united fc": "atlanta utd",
+    "orlando city sc": "orlando city",
+    "columbus crew": "columbus crew",
+    "fc cincinnati": "cincinnati",
+    "seattle sounders fc": "seattle sounders",
+    "minnesota united fc": "minnesota united",
+    "real salt lake": "real salt lake",
+    "houston dynamo fc": "houston dynamo",
+    "vancouver whitecaps fc": "vancouver whitecaps",
+    "charlotte fc": "charlotte",
+    "cf montreal": "montreal",
+    "toronto fc": "toronto fc",
+    "philadelphia union": "philadelphia union",
+    "dc united": "dc united",
+    "chicago fire fc": "chicago fire",
+    "new england revolution": "new england revolution",
+    "nashville sc": "nashville sc",
+    "sporting kansas city": "sporting kansas city",
+    "st louis city sc": "st. louis city",
+    "colorado rapids": "colorado rapids",
+    "fc dallas": "fc dallas",
+    "austin fc": "austin fc",
+    "portland timbers": "portland timbers",
+    "san jose earthquakes": "san jose earthquakes",
     # Inglaterra
     "manchester united": "man united",
     "manchester city": "man city",
@@ -179,7 +215,7 @@ def carregar_estatisticas_liga(url_csv: str, formato_novo: bool) -> Dict[str, di
 
     if formato_novo:
         col_h, col_a, col_hg, col_ag = "Home", "Away", "HG", "AG"
-        df = df.tail(380)
+        df = df.tail(450)
     else:
         col_h, col_a, col_hg, col_ag = "HomeTeam", "AwayTeam", "FTHG", "FTAG"
 
@@ -221,7 +257,7 @@ def buscar_odds_liga(api_key: str, odds_key: str) -> List[dict]:
 
     params = {
         "apiKey": api_key,
-        "regions": "eu,uk",
+        "regions": "eu,uk,us",
         "markets": "h2h,totals",
         "oddsFormat": "decimal",
         "commenceTimeFrom": agora_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -301,12 +337,12 @@ def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
 
         if liga["csv_historico"]:
             stats_liga = carregar_estatisticas_liga(liga["csv_historico"], liga["formato_novo"])
-            base_global_stats.update(stats_liga)
+            if not liga["formato_novo"]:
+                base_global_stats.update(stats_liga)
         else:
-            # Para Champions League, garante que as bases das Big 5 estejam carregadas
             if not base_global_stats:
                 for l_dom in LIGAS_ALVO:
-                    if l_dom["csv_historico"] and l_dom["odds_key"] != "soccer_brazil_campeonato":
+                    if l_dom["csv_historico"] and not l_dom["formato_novo"]:
                         base_global_stats.update(
                             carregar_estatisticas_liga(l_dom["csv_historico"], l_dom["formato_novo"])
                         )
