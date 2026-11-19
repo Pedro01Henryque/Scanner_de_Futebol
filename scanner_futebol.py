@@ -10,12 +10,11 @@ import requests
 from google import genai
 
 # ==============================================================================
-# CONFIGURAÇÕES DO SCANNER
+# CONFIGURAÇÕES DO SCANNER (BRASILEIRÃO + BIG 5 EUROPEIAS + CHAMPIONS LEAGUE)
 # ==============================================================================
 
 GEMINI_MODEL = "gemini-2.5-flash"
 
-# Ligas monitoradas na The Odds API + fontes abertas de resultados da temporada
 LIGAS_ALVO = [
     {
         "nome": "Brasileirão Série A",
@@ -47,13 +46,27 @@ LIGAS_ALVO = [
         "csv_historico": "https://www.football-data.co.uk/mmz4281/2627/D1.csv",
         "formato_novo": False,
     },
+    {
+        "nome": "Ligue 1 (França)",
+        "odds_key": "soccer_france_ligue_one",
+        "csv_historico": "https://www.football-data.co.uk/mmz4281/2627/F1.csv",
+        "formato_novo": False,
+    },
+    {
+        "nome": "UEFA Champions League",
+        "odds_key": "soccer_uefa_champs_league",
+        "csv_historico": None,  # Usa a base consolidada das ligas domésticas
+        "formato_novo": False,
+    },
 ]
 
 ALIASES_TIMES = {
+    # Brasil
     "atletico mineiro": "atletico-mg",
     "athletico paranaense": "athletico-pr",
     "red bull bragantino": "bragantino",
     "vasco da gama": "vasco",
+    # Inglaterra
     "manchester united": "man united",
     "manchester city": "man city",
     "nottingham forest": "nott'm forest",
@@ -61,15 +74,44 @@ ALIASES_TIMES = {
     "tottenham hotspur": "tottenham",
     "west ham united": "west ham",
     "wolverhampton wanderers": "wolves",
+    "brighton and hove albion": "brighton",
+    "leicester city": "leicester",
+    "ipswich town": "ipswich",
+    # Espanha
     "atletico madrid": "ath madrid",
     "athletic bilbao": "ath bilbao",
     "real betis": "betis",
     "real sociedad": "sociedad",
+    "celta vigo": "celta",
+    "rayo vallecano": "vallecano",
+    "deportivo alaves": "alaves",
+    # Itália
     "inter milan": "inter",
     "ac milan": "milan",
+    "as roma": "roma",
+    "ss lazio": "lazio",
+    "hellas verona": "verona",
+    # Alemanha
     "bayern munich": "bayern munich",
     "borussia dortmund": "dortmund",
     "bayer leverkusen": "leverkusen",
+    "borussia monchengladbach": "m'gladbach",
+    "eintracht frankfurt": "ein frankfurt",
+    "rb leipzig": "rb leipzig",
+    "vfb stuttgart": "stuttgart",
+    "sc freiburg": "freiburg",
+    "mainz 05": "mainz",
+    # França
+    "paris saint germain": "paris sg",
+    "paris saint-germain": "paris sg",
+    "olympique marseille": "marseille",
+    "olympique lyonnais": "lyon",
+    "as monaco": "monaco",
+    "stade rennais": "rennes",
+    "stade brestois": "brest",
+    "rc lens": "lens",
+    "losc lille": "lille",
+    "ogc nice": "nice",
 }
 
 
@@ -89,7 +131,6 @@ def enviar_telegram_texto(token: str, chat_id: str, mensagem_html: str) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     limite = 3800
 
-    # Divide por quebras de linha para não cortar tags HTML no meio
     blocos = mensagem_html.split("\n\n")
     parte_atual = ""
 
@@ -249,6 +290,7 @@ def encontrar_stats_time(nome_api: str, base_stats: Dict[str, dict]) -> Optional
 
 def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
     registros = []
+    base_global_stats: Dict[str, dict] = {}
 
     for liga in LIGAS_ALVO:
         print(f"\n[Analisando] {liga['nome']}...")
@@ -257,8 +299,20 @@ def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
             print("   -> Nenhum jogo nas próximas 30h.")
             continue
 
-        stats_liga = carregar_estatisticas_liga(liga["csv_historico"], liga["formato_novo"])
-        print(f"   -> {len(eventos)} jogo(s) encontrado(s) | {len(stats_liga)} times mapeados.")
+        if liga["csv_historico"]:
+            stats_liga = carregar_estatisticas_liga(liga["csv_historico"], liga["formato_novo"])
+            base_global_stats.update(stats_liga)
+        else:
+            # Para Champions League, garante que as bases das Big 5 estejam carregadas
+            if not base_global_stats:
+                for l_dom in LIGAS_ALVO:
+                    if l_dom["csv_historico"] and l_dom["odds_key"] != "soccer_brazil_campeonato":
+                        base_global_stats.update(
+                            carregar_estatisticas_liga(l_dom["csv_historico"], l_dom["formato_novo"])
+                        )
+            stats_liga = base_global_stats
+
+        print(f"   -> {len(eventos)} jogo(s) encontrado(s) | {len(stats_liga)} times na base.")
 
         for ev in eventos:
             home = ev["home_team"]
@@ -373,11 +427,12 @@ def main():
     df_jogos = df_jogos.sort_values(by=["edge_over25_%", "horario_brt"], ascending=[False, True], na_position="last")
     df_destaques = df_jogos[df_jogos["edge_over25_%"].notna() & (df_jogos["edge_over25_%"] >= 5.0)]
 
-    blocos = [f"⚽ <b>SCANNER MATINAL DE FUTEBOL — {data_hoje}</b>\n<i>{len(df_jogos)} jogo(s) analisado(s) nas próximas 30h</i>"]
+    blocos = [
+        f"⚽ <b>SCANNER MATINAL DE FUTEBOL — {data_hoje}</b>\n<i>{len(df_jogos)} jogo(s) analisado(s) nas próximas 30h</i>"
+    ]
 
-    # 1. Bloco de Oportunidades +EV (se houver)
     if not df_destaques.empty:
-        dest_txt = [f"🔥 <b>DESTAQUES COM VALOR (+EV ≥ 5%):</b>"]
+        dest_txt = ["🔥 <b>DESTAQUES COM VALOR (+EV ≥ 5%):</b>"]
         for _, r in df_destaques.iterrows():
             jogo = html.escape(str(r["jogo"]))
             dest_txt.append(
@@ -386,7 +441,6 @@ def main():
             )
         blocos.append("\n".join(dest_txt))
 
-    # 2. Grade Completa de Todos os Jogos do Dia (substitui o Excel)
     for liga, grupo in df_jogos.groupby("liga"):
         liga_txt = [f"🏆 <b>{html.escape(str(liga))}</b>"]
         for _, r in grupo.iterrows():
@@ -402,10 +456,9 @@ def main():
             )
         blocos.append("\n\n".join(liga_txt))
 
-    # 3. Leitura Rápida da IA sobre a grade do dia
     if gemini_key:
         client = genai.Client(http_options={"api_version": "v1beta"})
-        analise_ia = gerar_resumo_gemini(client, df_jogos.head(10))
+        analise_ia = gerar_resumo_gemini(client, df_jogos.head(12))
         if analise_ia:
             blocos.append(f"🧠 <b>Leitura Rápida IA:</b>\n{analise_ia}")
 
