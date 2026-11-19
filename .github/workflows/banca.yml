@@ -1,0 +1,40 @@
+name: Rastreador de Banca e ROI
+
+on:
+  schedule:
+    # Verifica novas mensagens no Telegram a cada 15 minutos
+    - cron: '*/15 * * * *'
+    # Envia o boletim semanal toda segunda-feira às 08:30 BRT (11:30 UTC)
+    - cron: '30 11 * * 1'
+  workflow_dispatch:
+
+jobs:
+  processar-banca:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Executar Rastreador de Banca
+        env:
+          TELEGRAM_BANCA_TOKEN: ${{ secrets.TELEGRAM_BANCA_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GSHEETS_ID: ${{ secrets.GSHEETS_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ "${{ github.event.schedule }}" = "30 11 * * 1" ]; then
+            python rastreador_banca.py --relatorio
+          else
+            python rastreador_banca.py
+          fi
