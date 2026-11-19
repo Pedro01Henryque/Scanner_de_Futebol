@@ -1,4 +1,6 @@
-google-genai
-pandas
-openpyxl
 requests
+pandas
+google-genai
+openpyxl
+gspread
+google-auth
