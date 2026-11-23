@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 GEMINI_MODEL = "gemini-2.5-flash"
 ABA_PLANILHA = "Página1"
+BRT = timezone(timedelta(hours=-3))
 
 
 class SelecaoBilhete(BaseModel):
@@ -279,7 +280,7 @@ def gerar_relatorio_banca(ws, titulo: str = "📊 RESUMO DE BANCA & ROI") -> str
     if len(linhas) <= 1:
         return "📭 Planilha ainda sem registros."
 
-    agora_brt = datetime.now(timezone.utc) - timedelta(hours=3)
+    agora_brt = datetime.now(BRT)
     mes_atual = agora_brt.strftime("/%m/%Y")
 
     total_apostado_geral = 0.0
@@ -350,6 +351,7 @@ def processar_mensagem(
     texto: str,
     foto_bytes: Optional[bytes] = None,
     mime_type: str = "image/jpeg",
+    timestamp_msg: Optional[int] = None,
 ) -> str:
     txt_lower = texto.strip().lower()
 
@@ -384,13 +386,18 @@ def processar_mensagem(
     if odd_final <= 1.0:
         return "⚠️ Odd total inválida (menor ou igual a 1.00). Verifique o print ou informe na legenda."
 
-    agora_brt = datetime.now(timezone.utc) - timedelta(hours=3)
-    data_hoje = agora_brt.strftime("%d/%m/%Y")
+    # Usa a data exata do envio da foto/mensagem no Telegram (em horário de Brasília)
+    if timestamp_msg:
+        dt_envio = datetime.fromtimestamp(timestamp_msg, tz=timezone.utc).astimezone(BRT)
+    else:
+        dt_envio = datetime.now(BRT)
+
+    data_registro = dt_envio.strftime("%d/%m/%Y")
     linha_destino = primeira_linha_vazia_col_a(ws)
 
     # Colunas A até F (Coluna F recebe valor numérico com vírgula SEM "R$", ex: 5,99)
     valores_a_f = [[
-        data_hoje,
+        data_registro,
         aposta.casa_aposta,
         aposta.esporte,
         descricao_final,
@@ -419,7 +426,7 @@ def processar_mensagem(
     retorno_previsto = round(aposta.valor_apostado * odd_final, 2)
 
     return (
-        f"📝 <b>Entrada Gravada na Linha {linha_destino}:</b>\n"
+        f"📝 <b>Entrada Gravada na Linha {linha_destino} ({data_registro}):</b>\n"
         f"🏛️ {html.escape(aposta.casa_aposta)} • 🏆 {html.escape(aposta.esporte)}\n"
         f"📌 <b>{html.escape(descricao_final)}</b>\n"
         f"🎯 Odd Total: <b>@{odd_final:.2f}</b> | Stake: <b>{formatar_valor_planilha(aposta.valor_apostado)}</b>\n"
@@ -453,7 +460,14 @@ def main():
     client = genai.Client(http_options={"api_version": "v1beta"})
     for m in mensagens:
         print(f"Processando entrada (foto={bool(m['foto_bytes'])}): {m['texto']}")
-        resposta = processar_mensagem(ws, client, m["texto"], m["foto_bytes"], m["mime_type"])
+        resposta = processar_mensagem(
+            ws,
+            client,
+            m["texto"],
+            m["foto_bytes"],
+            m["mime_type"],
+            m["timestamp"],
+        )
         enviar_telegram(tg_token, tg_chat, resposta)
 
 
