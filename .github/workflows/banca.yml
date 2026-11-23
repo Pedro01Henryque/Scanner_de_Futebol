@@ -2,8 +2,8 @@ name: Rastreador de Banca e ROI
 
 on:
   schedule:
-    # Verifica novas mensagens no Telegram a cada 15 minutos
-    - cron: '*/45 * * * *'
+    # Roda duas vezes por dia: 09:00 BRT (12:00 UTC) e 18:00 BRT (21:00 UTC)
+    - cron: '0 12,21 * * *'
     # Envia o boletim semanal toda segunda-feira às 08:30 BRT (11:30 UTC)
     - cron: '30 11 * * 1'
   workflow_dispatch:
