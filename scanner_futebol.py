@@ -16,6 +16,7 @@ from google import genai
 
 GEMINI_MODEL = "gemini-2.5-flash"
 EDGE_MINIMO_PCT = 2.0  # Filtra apenas oportunidades com Edge >= +2.0% (Over 2.5 ou Under 2.5)
+BRT = timezone(timedelta(hours=-3))
 
 LIGAS_ALVO = [
     {
@@ -154,8 +155,19 @@ ALIASES_TIMES = {
 
 
 # ==============================================================================
-# UTILITÁRIOS DE TEXTO E TELEGRAM
+# UTILITÁRIOS DE TEXTO, JANELA DE DATA E TELEGRAM
 # ==============================================================================
+
+def obter_janela_dia_seguinte() -> tuple[datetime, datetime, str]:
+    """Retorna (inicio_utc, fim_utc, data_amanha_str) correspondentes a 00:00–23:59 BRT de amanhã."""
+    agora_brt = datetime.now(BRT)
+    amanha_brt = (agora_brt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    fim_amanha_brt = amanha_brt.replace(hour=23, minute=59, second=59)
+
+    inicio_utc = amanha_brt.astimezone(timezone.utc)
+    fim_utc = fim_amanha_brt.astimezone(timezone.utc)
+    return inicio_utc, fim_utc, amanha_brt.strftime("%d/%m/%Y")
+
 
 def normalizar_time(nome: str) -> str:
     nfkd = unicodedata.normalize("NFKD", str(nome))
@@ -205,7 +217,7 @@ def enviar_telegram_texto(token: str, chat_id: str, mensagem_html: str) -> None:
 
 
 # ==============================================================================
-# COLETA DE ESTATÍSTICAS HISTÓRICAS E ODDS DO DIA
+# COLETA DE ESTATÍSTICAS HISTÓRICAS E ODDS DO DIA SEGUINTE
 # ==============================================================================
 
 def carregar_estatisticas_liga(url_csv: str, formato_novo: bool) -> Dict[str, dict]:
@@ -252,18 +264,16 @@ def carregar_estatisticas_liga(url_csv: str, formato_novo: bool) -> Dict[str, di
     return stats_times
 
 
-def buscar_odds_liga(api_key: str, odds_key: str) -> List[dict]:
+def buscar_odds_liga(api_key: str, odds_key: str, inicio_utc: datetime, fim_utc: datetime) -> List[dict]:
     url = f"https://api.the-odds-api.com/v4/sports/{odds_key}/odds"
-    agora_utc = datetime.now(timezone.utc)
-    limite_utc = agora_utc + timedelta(hours=30)
 
     params = {
         "apiKey": api_key,
         "regions": "eu,uk,us",
         "markets": "h2h,totals",
         "oddsFormat": "decimal",
-        "commenceTimeFrom": agora_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "commenceTimeTo": limite_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "commenceTimeFrom": inicio_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "commenceTimeTo": fim_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
     try:
@@ -326,15 +336,15 @@ def encontrar_stats_time(nome_api: str, base_stats: Dict[str, dict]) -> Optional
     return None
 
 
-def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
+def analisar_oportunidades_dia(odds_api_key: str, inicio_utc: datetime, fim_utc: datetime, data_alvo_str: str) -> pd.DataFrame:
     registros = []
     base_global_stats: Dict[str, dict] = {}
 
     for liga in LIGAS_ALVO:
-        print(f"\n[Analisando] {liga['nome']}...")
-        eventos = buscar_odds_liga(odds_api_key, liga["odds_key"])
+        print(f"\n[Analisando] {liga['nome']} ({data_alvo_str})...")
+        eventos = buscar_odds_liga(odds_api_key, liga["odds_key"], inicio_utc, fim_utc)
         if not eventos:
-            print("   -> Nenhum jogo nas próximas 30h.")
+            print(f"   -> Nenhum jogo agendado para {data_alvo_str}.")
             continue
 
         if liga["csv_historico"]:
@@ -356,7 +366,13 @@ def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
             home = ev["home_team"]
             away = ev["away_team"]
             horario_utc = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00"))
-            horario_brt = (horario_utc - timedelta(hours=3)).strftime("%d/%m %H:%M")
+            horario_brt_dt = horario_utc.astimezone(BRT)
+
+            # Dupla garantia: descarta qualquer evento fora da data de amanhã em BRT
+            if horario_brt_dt.strftime("%d/%m/%Y") != data_alvo_str:
+                continue
+
+            horario_brt = horario_brt_dt.strftime("%d/%m %H:%M")
 
             odds = extrair_melhores_odds_evento(ev)
             st_home = encontrar_stats_time(home, stats_liga)
@@ -431,14 +447,14 @@ def analisar_oportunidades_dia(odds_api_key: str) -> pd.DataFrame:
 # SÍNTESE COM GEMINI E DISPARO FILTRADO NO TELEGRAM
 # ==============================================================================
 
-def gerar_resumo_gemini(client: genai.Client, df_filtrados: pd.DataFrame) -> str:
+def gerar_resumo_gemini(client: genai.Client, df_filtrados: pd.DataFrame, data_alvo_str: str) -> str:
     tabela_txt = df_filtrados[
         ["liga", "jogo", "mercado_valor", "odd_valor", "prob_hist_%", "edge_%", "prob_btts_est_%", "media_gols_projetada"]
     ].to_string(index=False)
 
     prompt = f"""
     Você é um analista quantitativo de apostas esportivas.
-    Analise estas oportunidades filtradas hoje com Edge positivo (+EV):
+    Analise estas oportunidades filtradas para amanhã ({data_alvo_str}) com Edge positivo (+EV):
     
     {tabela_txt}
     
@@ -446,10 +462,10 @@ def gerar_resumo_gemini(client: genai.Client, df_filtrados: pd.DataFrame) -> str
     (explicando por que o histórico, a odd e a projeção de gols sustentam o valor ou se há algum ponto de atenção).
     
     REGRAS ESTRITAS DE FORMATAÇÃO:
-    - Use APENAS tags HTML <b> e <i>.
-    - NUNCA use asteriscos (*), cerquilhas (#) ou traços de Markdown.
-    - Comece cada tópico com "• " seguido do nome do jogo em <b>negrito</b>.
-    - Não coloque título nem saudação no início.
+- Use APENAS tags HTML <b> e <i>.
+- NUNCA use asteriscos (*), cerquilhas (#) ou traços de Markdown.
+- Comece cada tópico com "• " seguido do nome do jogo em <b>negrito</b>.
+- Não coloque título nem saudação no início.
     """
     for tentativa in range(2):
         try:
@@ -483,8 +499,8 @@ def main():
     if not odds_key:
         raise EnvironmentError("Defina ODDS_API_KEY nos Secrets do GitHub.")
 
-    df_todos = analisar_oportunidades_dia(odds_key)
-    data_hoje = datetime.now().strftime("%d/%m/%Y")
+    inicio_utc, fim_utc, data_amanha = obter_janela_dia_seguinte()
+    df_todos = analisar_oportunidades_dia(odds_key, inicio_utc, fim_utc, data_amanha)
 
     if not tg_token or not tg_chat:
         print("[Aviso] Telegram não configurado.")
@@ -496,7 +512,7 @@ def main():
         enviar_telegram_texto(
             tg_token,
             tg_chat,
-            f"⚽ <b>SCANNER +EV FUTEBOL — {data_hoje}</b>\n\nSem jogos das ligas monitoradas nas próximas 30 horas.",
+            f"⚽ <b>SCANNER +EV FUTEBOL — Jogos de {data_amanha}</b>\n\nSem jogos das ligas monitoradas agendados para amanhã.",
         )
         return
 
@@ -506,14 +522,14 @@ def main():
         enviar_telegram_texto(
             tg_token,
             tg_chat,
-            f"⚽ <b>SCANNER +EV FUTEBOL — {data_hoje}</b>\n"
+            f"⚽ <b>SCANNER +EV FUTEBOL — Jogos de {data_amanha}</b>\n"
             f"<i>{total_analisados} jogo(s) varrido(s) nas 8 ligas</i>\n\n"
-            f"📭 Nenhuma oportunidade com Edge ≥ +{EDGE_MINIMO_PCT:.0f}% encontrada hoje.",
+            f"📭 Nenhuma oportunidade com Edge ≥ +{EDGE_MINIMO_PCT:.0f}% encontrada para amanhã.",
         )
         return
 
     blocos = [
-        f"⚽ <b>SCANNER +EV FUTEBOL — {data_hoje}</b>\n"
+        f"⚽ <b>SCANNER +EV FUTEBOL — Jogos de {data_amanha}</b>\n"
         f"<i>{len(df_valor)} oportunidade(s) com Edge ≥ +{EDGE_MINIMO_PCT:.0f}% (de {total_analisados} jogos analisados)</i>"
     ]
 
@@ -535,13 +551,13 @@ def main():
     # Leitura Rápida IA focada apenas nos jogos filtrados
     if gemini_key:
         client = genai.Client(http_options={"api_version": "v1beta"})
-        analise_ia = gerar_resumo_gemini(client, df_valor.head(10))
+        analise_ia = gerar_resumo_gemini(client, df_valor.head(10), data_amanha)
         if analise_ia:
             blocos.append(f"🧠 <b>Leitura Rápida IA:</b>\n{analise_ia}")
 
     mensagem_final = "\n\n".join(blocos)
     enviar_telegram_texto(tg_token, tg_chat, mensagem_final)
-    print(f"\n[Concluído] {len(df_valor)} oportunidade(s) com Edge positivo enviada(s)!")
+    print(f"\n[Concluído] {len(df_valor)} oportunidade(s) com Edge positivo enviada(s) para {data_amanha}!")
 
 
 if __name__ == "__main__":
